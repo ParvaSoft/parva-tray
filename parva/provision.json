@@ -1,0 +1,7 @@
+[
+  {
+    "description": "CA Parvasoft: rende fidati i certificati con cui firmiamo le richieste di stampa",
+    "type": "ca",
+    "data": "certs/ca.crt"
+  }
+]
