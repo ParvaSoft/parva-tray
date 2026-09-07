@@ -101,3 +101,38 @@ Il brief per il reparto grafico è in `assets/branding/icone-qz-tray.html`
 
 Upstream è LGPL-2.1. Il repo privato va bene; se distribuiamo a un cliente un
 binario modificato, dobbiamo rendergli disponibile il sorgente delle modifiche.
+
+## Certificati di firma (niente popup)
+
+QZ mostra un popup di conferma a ogni richiesta di stampa, a meno che la
+richiesta non sia firmata con un certificato che risale a una CA di cui si
+fida. Serve una CA nostra, non c'entra con i certificati HTTPS dei siti:
+il trust è sull'impronta del certificato, non sul dominio, quindi lo stesso
+certificato vale per pre, prod e qualunque URL futuro.
+
+```bash
+parva/make-signing-certs.sh          # CA + certificato "prod"
+parva/make-signing-certs.sh pre      # altro ambiente, stessa CA
+```
+
+Output in `parva/certs/` (non tracciato):
+
+| file | dove va | segreto |
+|---|---|---|
+| `ca.crt` | nel pacchetto come `override.crt`, accanto al jar | no |
+| `<env>.crt` | servito dal backend su `/qz/cert` | no |
+| `<env>-key.pem` | solo sul backend, fuori dal war | **sì** |
+| `ca-key.pem` | offline, serve solo a emettere altri certificati | **sì** |
+
+La CA si genera una volta sola: rigenerarla invalida tutte le installazioni
+già in campo. Lo script se la trova la riusa.
+
+Con `override.crt` presente, QZ aggiunge da solo il certificato alla lista
+consentiti alla prima richiesta valida (`Certificate.java:248-261`), quindi
+il popup non compare mai — la cartella `whitelist/` serve solo se si vuole
+pre-approvare un certificato *senza* passare da una CA.
+
+Il backend espone due endpoint: `/qz/cert` restituisce `<env>.crt`, `/qz/sign`
+firma la stringa ricevuta con `SHA512withRSA` e la restituisce in base64.
+`/qz/sign` firma qualsiasi cosa gli si passi: va dietro l'autenticazione
+dell'applicazione, altrimenti equivale a pubblicare la chiave privata.
