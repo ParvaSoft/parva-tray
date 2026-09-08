@@ -9,8 +9,11 @@
 # installazioni gia' in campo. Per aggiungere un ambiente rilancia lo script
 # con un nome diverso ("pre", "collaudo"), la CA esistente viene riusata.
 #
-# La passphrase della CA puo' essere passata in QZ_CA_PASS per usi non
-# interattivi (CI); altrimenti viene chiesta a video.
+# La passphrase protegge ca-key.pem e viene chiesta a video: alla creazione della
+# CA e a ogni emissione di un certificato. Non e' salvata da nessuna parte, se la
+# perdi devi rigenerare la CA e reinstallare il client ovunque.
+# QZ_CA_PASS la passa in modo non interattivo, ma solo su macchine fidate che
+# abbiano gia' ca-key.pem: finisce nella command line, visibile in ps.
 
 set -euo pipefail
 
