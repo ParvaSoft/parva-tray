@@ -167,8 +167,8 @@ Il fork si presenta come "Parva Tray". Le stringhe stanno in due soli file:
 
 * `ant/project.properties` — `vendor.*` e `project.*`. Tutti i template degli
   installer (nsi, plist, pkg, dmg, makeself) leggono queste property, quindi
-  negli installer non c'e' nessuna stringa da cambiare a mano.
-* `src/qz/common/Constants.java` — il blocco `ABOUT_*`, piu' `PROPS_FILE` e
+  negli installer non c'è nessuna stringa da cambiare a mano.
+* `src/qz/common/Constants.java` — il blocco `ABOUT_*`, più `PROPS_FILE` e
   `DATA_DIR`. Da `ABOUT_URL` e `ABOUT_COMPANY` derivano a cascata il bundle id
   Apple, gli URL di licensing/support/privacy/download e il testo del popup
   (`Verified by Parvasoft`).
@@ -178,8 +178,8 @@ ovvi:**
 
 | ant | java | valore | cosa succede se divergono |
 |---|---|---|---|
-| `project.filename` | `Constants.PROPS_FILE` | `parva-tray` | e' anche il nome del jar che l'app cerca a runtime (`SystemUtilities.java:726`): se non combaciano, non si trova da sola |
-| `project.datadir` | `Constants.DATA_DIR` | `parva` | cartella dati e protocollo URL registrato (`parva://`, `WindowsInstaller.java:126`); `vendor.name` deve seguire, e' lo schema URL su macOS |
+| `project.filename` | `Constants.PROPS_FILE` | `parva-tray` | è anche il nome del jar che l'app cerca a runtime (`SystemUtilities.java:726`): se non combaciano, non si trova da sola |
+| `project.datadir` | `Constants.DATA_DIR` | `parva` | cartella dati e protocollo URL registrato (`parva://`, `WindowsInstaller.java:126`); `vendor.name` deve seguire, è lo schema URL su macOS |
 
 Verifica veloce dopo ogni merge da upstream:
 
@@ -192,11 +192,11 @@ sorgenti restano: la LGPL permette di rinominare il prodotto ma impone di
 conservare copyright e licenza. Restano anche `CRL_URL` (`crl.qz.io`) e
 `localhost.qz.io` in `CertificateChainBuilder`, che sono funzionali e non
 attribuzione, e l'enum `Remover.QZ`, che serve a disinstallare un QZ Tray
-originale eventualmente gia' presente sulla macchina.
+originale eventualmente già presente sulla macchina.
 
 Cambiando `ABOUT_EMAIL` la costante upstream `IS_REBRANDED` (`Constants.java:53`)
 diventa `true` da sola: l'About passa in modalita' ridotta e sparisce il
-controllo aggiornamenti verso le release di `qzind/tray`, che per un fork e'
+controllo aggiornamenti verso le release di `qzind/tray`, che per un fork è
 quello che vogliamo.
 
 ## Certificati di firma QZ
@@ -345,7 +345,49 @@ qz.security.setSignaturePromise(toSign => (resolve, reject) =>
 L'algoritmo va dichiarato su entrambi i lati: il default lato QZ è SHA1
 (`PrintSocketClient.java:221`).
 
-### 5. Se il popup esce lo stesso
+### 5. Provare tutto in locale
+
+`parva/test-backend.py` fa da backend finto: serve la pagina demo prodotta dalla
+build e i due endpoint che in produzione stanno sull'applicazione. Solo stdlib
+Python e `openssl`, niente da installare.
+
+```bash
+ant                                   # serve out/dist/demo/sample.html
+parva/test-backend.py                 # ambiente "prod", http://127.0.0.1:8080
+parva/test-backend.py pre 9090        # altro ambiente, altra porta
+parva/test-backend.py --selftest      # firma e riverifica, senza avviare il server
+```
+
+Non modifica la pagina demo: le appende uno script che sovrascrive le promise di
+qz-tray.js (sono semplici assegnazioni, `js/qz-tray.js:2811`, quindi vince
+l'ultima) e rimpiazza `qz:launch` con il nostro schema, che la demo di upstream
+ha hardcoded. Lo schema lo legge da `project.datadir`, così resta allineato da
+solo.
+
+Perché il test sia significativo serve **Parva Tray installato dal pacchetto
+costruito con `-Dprovision.file`**: è l'installazione che porta dentro la CA. Con
+un'installazione senza CA il popup esce comunque, e non è un problema di firma.
+
+In cima al tab "Pixel Printing" lo script aggiunge un riquadro **Direct printing
+(spooler)**, che la demo di upstream non ha: stampa con `format: "direct"` (vedi
+"I due percorsi di stampa"). A campo vuoto usa il file trascinato sulla pagina,
+altrimenti l'URL che gli indichi. Usa la config del pannello sottostante, quindi
+lasciando Orientation e Size su Default vengono dedotti dal PDF.
+
+Il test è passato se stampi dalla pagina demo e non compare nessun popup. Per
+isolare un fallimento prima di tirare in mezzo QZ:
+
+```bash
+curl -s http://127.0.0.1:8080/qz/cert | openssl x509 -noout -subject
+curl -s --get --data-urlencode 'request=prova' http://127.0.0.1:8080/qz/sign
+```
+
+**Non è un backend di riferimento.** Firma qualunque stringa senza chiedere
+niente a nessuno: ascolta solo su `127.0.0.1` e serve a provare il giro, non a
+essere copiato in produzione. Quello vero è al punto 3, con l'autenticazione
+dell'applicazione davanti.
+
+### 6. Se il popup esce lo stesso
 
 QZ fa quattro controlli in fila; il testo del popup dice quale è fallito:
 
@@ -359,7 +401,7 @@ QZ fa quattro controlli in fila; il testo del popup dice quale è fallito:
 I log sono in `%APPDATA%\parva\debug.log` su Windows e
 `~/Library/Application Support/parva/debug.log` su macOS (`App.java:130`).
 
-### 6. Aggiungere un ambiente o rinnovare
+### 7. Aggiungere un ambiente o rinnovare
 
 Nuovo ambiente: `parva/make-signing-certs.sh <nome>`, la CA resta la stessa e le
 installazioni esistenti si fidano subito del nuovo certificato — nessun
@@ -369,6 +411,125 @@ solo sul backend corrispondente.
 I certificati durano 10 anni, la CA 20. Alla scadenza di un certificato si
 rigenera solo quello; la CA si tocca solo se scade lei, e in quel caso va
 rifatto l'installer.
+
+## Stampa: qualità e configurazione della coda
+
+Se la stampa esce scadente — sfondi grigi a bande o "colonne", testo poco
+contrastato, linee sottili irregolari — **prima di cercare l'opzione giusta in
+QZ, controlla come è aggiunta la stampante.** Nel nostro caso reale nessuna
+opzione c'entrava: era la coda.
+
+Il sintomo tipico è che la stessa pagina, stampata da Anteprima, viene bene.
+Non è perché Anteprima sia più brava: è perché sta parlando con un'altra
+coda, quella AirPrint che macOS crea al volo per le "stampanti nelle vicinanze".
+
+### Cosa succede
+
+Una coda creata con un driver generico ha un PPD con un filtro di
+rasterizzazione, per esempio:
+
+```
+*NickName:   "Generic PCL Laser Printer"
+*cupsFilter: "application/vnd.cups-raster 50 rastertohp"
+```
+
+Con questo filtro il Mac rasterizza **ogni** job in locale e lo converte in PCL
+a 1 bit: il grigio non esiste come tono, viene simulato con un retino di punti,
+e a 300 dpi quel retino si vede a occhio nudo. La stampante non riceve mai il
+PDF, riceve punti bianchi e neri già decisi.
+
+Vale per qualunque percorso di stampa — pixel printing, direct printing, perfino
+`lp` da riga di comando — quindi **non è risolvibile da codice**.
+
+Una coda AirPrint non ha quel filtro:
+
+```
+*NickName:    "Brother MFC-L5750DW series-AirPrint"
+*cupsFilter2: "image/urf image/urf 10 -"
+```
+
+Il `-` significa nessuna conversione: il documento arriva intatto e lo
+rasterizza il RIP della stampante, alla sua risoluzione nativa e con i toni di
+grigio veri.
+
+### Come si verifica
+
+```bash
+lpstat -v                                        # come sono agganciate le code
+grep -E '^\*NickName|^\*cupsFilter' /etc/cups/ppd/<coda>.ppd
+```
+
+Segnali di coda da rifare: `device-uri` che contiene `_printer._tcp` (il
+protocollo LPR legacy), `NickName` che inizia per `Generic`, presenza di un
+filtro `rastertohp` o simili.
+
+Per sapere cosa saprebbe fare davvero la stampante, si interroga direttamente:
+
+```bash
+ipptool -tv "ipp://<indirizzo>:631/ipp/print" get-printer-attributes.test \
+    | grep -E "document-format-supported|printer-resolution-supported"
+```
+
+Sulla MFC-L5750DW risponde `application/pdf` fra i formati e risoluzioni fino a
+1200 dpi: tutto sprecato passando per il PCL generico.
+
+### Come si sistema
+
+Da interfaccia, su macOS: Impostazioni di Sistema -> Stampanti e Scanner ->
+Aggiungi -> scheda **IP** -> Protocollo **AirPrint** (non "Internet Printing
+Protocol - IPP": quello fa scegliere il driver a mano e si finisce sulle
+generiche). Il campo Coda si lascia vuoto.
+
+Equivalente da terminale:
+
+```bash
+sudo lpadmin -p <nome> -E -v "ipp://<indirizzo>:631/ipp/print" -m everywhere
+```
+
+Dopo l'aggiunta il modello deve risultare `... -AirPrint` e non `Generic ...`.
+Conviene anche renderla la stampante predefinita, altrimenti chi non sceglie
+esplicitamente ricade sulla coda vecchia.
+
+**Va nelle istruzioni di installazione per i clienti.** Su una macchina con la
+stampante aggiunta male, la qualità è compromessa a monte e nessuna versione
+del nostro software la recupera. Su Windows lo stack è diverso e si usa il
+driver del produttore, ma il principio resta: driver generico, qualità generica.
+
+## I due percorsi di stampa
+
+QZ può stampare un documento in due modi diversi, e conviene sapere quale si sta
+usando perché rispettano opzioni diverse.
+
+| | pixel printing | direct printing |
+|---|---|---|
+| come si chiede | `type: "pixel"`, `format: "pdf"` (o `html`, `image`) | `type: "pixel"`, `format: "direct"` |
+| chi disegna | PDFBox dentro Parva Tray | il driver / la stampante |
+| opzioni rispettate | tutte: scala, margini, dimensioni, densità, rotazione | orientamento, formato, densità, duplex, colore, copie |
+| quando conviene | HTML e immagini generate al volo, quando serve controllare la geometria da codice | PDF già impaginati, come le fatture |
+
+`format: "direct"` richiede `type: "pixel"`: con `type: "raw"` il formato viene
+forzato a `command` (`PrintingUtilities.java:138`) e la stampa fallisce con
+"Cannot parse ... into a raw DIRECT command".
+
+In direct il documento viene consegnato allo spooler senza reinterpretarlo. I
+dati si passano con `flavor: "file"` (una URL, anche `file://`, aperta dal
+processo di Parva Tray) oppure `flavor: "base64"`.
+
+### Patch nostre su PrintDirect
+
+`src/qz/printer/action/PrintDirect.java` è un file di upstream che abbiamo
+modificato: da rivedere a ogni merge. Upstream mandava allo spooler il solo nome
+del job, quindi tutte le opzioni del client venivano perse e il risultato
+dipendeva da come era configurata la coda. Ora:
+
+* orientamento, formato carta, densità, duplex, colore e copie finiscono negli
+  attributi del job;
+* orientamento e formato, se il client non li specifica, vengono dedotti dalla
+  prima pagina del PDF (un A4 orizzontale non veniva ruotato);
+* una densità non supportata dalla stampante viene segnalata a log invece di
+  sparire in silenzio;
+* i dati base64 con prefisso `data:...;base64,` vengono ripuliti, altrimenti la
+  stampante riceve byte spazzatura e li stampa come pagine di testo.
 
 ## Licenza
 
