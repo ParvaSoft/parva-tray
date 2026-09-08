@@ -1,5 +1,10 @@
 [
   {
+    "description": "Disinstalla un QZ Tray originale gia' presente: altrimenti resta in esecuzione e tiene la porta 8181, e il browser parla con lui invece che con noi",
+    "type": "remover",
+    "data": "qz"
+  },
+  {
     "description": "CA Parvasoft: rende fidati i certificati con cui firmiamo le richieste di stampa",
     "type": "ca",
     "data": "certs/ca.crt"
