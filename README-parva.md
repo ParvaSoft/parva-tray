@@ -59,28 +59,92 @@ git merge v2.2.4     # o il tag che serve
 ## Prerequisiti di build
 
 * **JDK 25** — obbligatorio: `ant/project.properties` fissa `javac.source/target=25`
-  e JavaFX 27-ea non gira sotto. Su macOS: `brew install --cask corretto@25`, poi
-  `export JAVA_HOME=$(/usr/libexec/java_home -v 25)`.
+  e JavaFX 27-ea non gira sotto.
 * **Ant**
-* **NSIS** (`brew install makensis`) — solo per generare l'installer Windows.
+* **NSIS** — solo per l'installer Windows.
+
+L'installazione di questi tre cambia a seconda dell'host, vedi sotto.
 
 ## Build
 
+| target | produce | dove si può fare |
+|---|---|---|
+| `ant` | solo il jar | ovunque |
+| `ant nsis` | installer Windows (`.exe`) | ovunque, serve NSIS |
+| `ant makeself` | installer Linux (`.run`) | macOS e Linux, serve `makeself` |
+| `ant pkgbuild` | `.pkg` macOS | **solo macOS** |
+| `ant dmg` | `.dmg` macOS | **solo macOS** |
+
+I target Apple chiamano `pkgbuild`, `productbuild` e `codesign`, che esistono
+solo su macOS; l'exe Windows invece è cross-compilabile perché `makensis` gira
+anche altrove e gli installer si scaricano da soli la JRE della piattaforma di
+destinazione.
+
+**Passa sempre `-Dprovision.file=parva/provision.json`** ai target installer,
+altrimenti esce un pacchetto senza la nostra CA e QZ mostra il popup a ogni
+stampa (vedi "Certificati di firma QZ"). Il jar da solo non c'entra: la CA entra
+a livello di installer.
+
+L'architettura di default è quella dell'host. Per l'altra:
+`-Dtarget.arch=x86_64` oppure `-Dtarget.arch=aarch64`; sono due pacchetti
+distinti, non uno universale.
+
+Output in `out/`. Non serve `ant clean` fra una build e l'altra: `distribute` fa
+già `quick-clean` e il target `provision` ricrea `out/dist/provision` ogni volta
+(`build.xml:366`).
+
+### Su macOS
+
 ```bash
-ant                 # compila e impacchetta il jar
-ant nsis            # installer Windows (cross-compilabile da macOS e Linux)
-ant dmg             # dmg macOS
-ant pkgbuild        # pkg macOS
-ant makeself        # installer Linux
+brew install --cask corretto@25
+brew install ant makensis makeself   # makeself solo per il target Linux
+
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+
+ant pkgbuild -Dprovision.file=parva/provision.json                    # pkg
+ant dmg      -Dprovision.file=parva/provision.json                    # dmg
+ant nsis     -Dprovision.file=parva/provision.json -Dtarget.arch=x86_64   # exe
 ```
 
-Gli installer scaricano e impacchettano da soli la JRE della piattaforma di
-destinazione, quindi non serve una macchina Windows per fare l'exe.
-L'architettura di default è quella dell'host: per l'altra, `-Dtarget.arch=x86_64`
-oppure `-Dtarget.arch=aarch64`.
+Su un Mac ARM il default è `aarch64`: per l'exe Windows serve `x86_64`
+esplicito, o esce un installer che gira solo sui Windows ARM.
+
+Per **provare** l'installazione usa il `.pkg`, non il `.dmg`: solo il pkg esegue
+gli script di post-install, che sono dove il provisioning installa la CA e
+scrive `authcert.override`. Dopo l'installazione:
+
+```bash
+grep authcert.override ~/Library/Application\ Support/qz/qz-tray.properties
+```
+
+Senza l'identità di firma Apple in keychain, `get-identity`
+(`ant/apple/installer.xml:352`) ripiega sulla firma ad-hoc: il pacchetto si
+costruisce e si installa in locale, ma su altre macchine Gatekeeper lo blocca.
+
+### Su Windows
+
+Da PowerShell, con JDK 25 (Amazon Corretto), Ant e NSIS installati. NSIS va
+lasciato nel percorso di default `C:\Program Files (x86)\NSIS`: il build lo
+cerca lì (`ant/windows/installer.xml:166`).
+
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Amazon Corretto\jdk25"   # adatta alla versione installata
+
+ant nsis -Dprovision.file=parva/provision.json
+```
+
+L'architettura di default è quella della macchina, quindi su un Windows x64 esce
+già `x86_64`. I target `dmg` e `pkgbuild` da qui non si possono fare.
+
+Il `.pkg`/`.dmg` per i Mac va costruito su un Mac; se non ce n'è uno a
+disposizione, l'unica via è una CI con runner macOS.
+
+### Firma dei binari
 
 La firma del codice usa `jsign` e resta inattiva senza certificato configurato:
-i binari che escono da una build locale non sono firmati.
+i binari che escono da una build locale non sono firmati. È una cosa diversa dai
+certificati di firma QZ descritti più sotto — quelli servono a togliere il popup
+di stampa, questa a non far protestare Windows e macOS all'installazione.
 
 ## Branding
 
@@ -115,8 +179,22 @@ parva/make-signing-certs.sh          # CA + certificato "prod"
 parva/make-signing-certs.sh pre      # altro ambiente, riusa la stessa CA
 ```
 
-Serve `openssl`. La passphrase della CA viene chiesta a video; in CI si passa
-in `QZ_CA_PASS`. Lo script verifica catena e firma prima di uscire.
+Serve `openssl`. Lo script verifica catena e firma prima di uscire.
+
+La passphrase protegge solo `ca-key.pem` e viene chiesta a video in due momenti:
+quando si crea la CA (una volta sola) e a ogni emissione di un certificato per un
+nuovo ambiente. È sempre la stessa, anche se openssl la chiama `PEM pass phrase`
+quando crea la chiave e `pass phrase for ca-key.pem` quando la riusa per firmare.
+**Non è salvata da nessuna parte**: persa la passphrase non si possono più emettere
+certificati, e l'unica via è rigenerare la CA e reinstallare il client su tutte le
+macchine. Va nel password manager insieme al backup della chiave. La chiave
+d'ambiente (`<env>-key.pem`) è invece senza passphrase, perché il backend deve
+caricarla all'avvio da sola.
+
+Esiste `QZ_CA_PASS` per usi non interattivi, ma serve solo su una macchina fidata
+che abbia già `ca-key.pem`: in una CI normale quella chiave non ci deve stare. La
+passphrase finisce comunque nella command line di openssl, visibile in `ps` sulla
+stessa macchina.
 
 **La CA si genera una volta sola.** Rigenerarla invalida tutte le installazioni
 già in campo: lo script se la trova la riusa, non cancellare `parva/certs/ca.crt`.
