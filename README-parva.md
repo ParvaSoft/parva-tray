@@ -114,7 +114,7 @@ gli script di post-install, che sono dove il provisioning installa la CA e
 scrive `authcert.override`. Dopo l'installazione:
 
 ```bash
-grep authcert.override ~/Library/Application\ Support/qz/qz-tray.properties
+grep authcert.override ~/Library/Application\ Support/parva/parva-tray.properties
 ```
 
 Senza l'identità di firma Apple in keychain, `get-identity`
@@ -146,7 +146,7 @@ i binari che escono da una build locale non sono firmati. È una cosa diversa da
 certificati di firma QZ descritti più sotto — quelli servono a togliere il popup
 di stampa, questa a non far protestare Windows e macOS all'installazione.
 
-## Branding
+## Branding: icone
 
 Le icone stanno in **due** posti:
 
@@ -160,6 +160,44 @@ Le icone stanno in **due** posti:
 
 Il brief per il reparto grafico è in `assets/branding/icone-qz-tray.html`
 (non tracciato).
+
+## Branding: nomi e attribuzione
+
+Il fork si presenta come "Parva Tray". Le stringhe stanno in due soli file:
+
+* `ant/project.properties` — `vendor.*` e `project.*`. Tutti i template degli
+  installer (nsi, plist, pkg, dmg, makeself) leggono queste property, quindi
+  negli installer non c'e' nessuna stringa da cambiare a mano.
+* `src/qz/common/Constants.java` — il blocco `ABOUT_*`, piu' `PROPS_FILE` e
+  `DATA_DIR`. Da `ABOUT_URL` e `ABOUT_COMPANY` derivano a cascata il bundle id
+  Apple, gli URL di licensing/support/privacy/download e il testo del popup
+  (`Verified by Parvasoft`).
+
+**Due valori vanno tenuti identici fra i due file, o l'app si rompe in modi non
+ovvi:**
+
+| ant | java | valore | cosa succede se divergono |
+|---|---|---|---|
+| `project.filename` | `Constants.PROPS_FILE` | `parva-tray` | e' anche il nome del jar che l'app cerca a runtime (`SystemUtilities.java:726`): se non combaciano, non si trova da sola |
+| `project.datadir` | `Constants.DATA_DIR` | `parva` | cartella dati e protocollo URL registrato (`parva://`, `WindowsInstaller.java:126`); `vendor.name` deve seguire, e' lo schema URL su macOS |
+
+Verifica veloce dopo ogni merge da upstream:
+
+```bash
+ant && java -jar out/dist/parva-tray.jar --bundleid    # eu.parvasoft.parva-tray
+```
+
+**Cosa non si tocca.** Le intestazioni di copyright "QZ Industries, LLC" nei
+sorgenti restano: la LGPL permette di rinominare il prodotto ma impone di
+conservare copyright e licenza. Restano anche `CRL_URL` (`crl.qz.io`) e
+`localhost.qz.io` in `CertificateChainBuilder`, che sono funzionali e non
+attribuzione, e l'enum `Remover.QZ`, che serve a disinstallare un QZ Tray
+originale eventualmente gia' presente sulla macchina.
+
+Cambiando `ABOUT_EMAIL` la costante upstream `IS_REBRANDED` (`Constants.java:53`)
+diventa `true` da sola: l'About passa in modalita' ridotta e sparisce il
+controllo aggiornamenti verso le release di `qzind/tray`, che per un fork e'
+quello che vogliamo.
 
 ## Certificati di firma QZ
 
@@ -318,8 +356,8 @@ QZ fa quattro controlli in fila; il testo del popup dice quale è fallito:
 | `Untrusted website` | manca la CA nell'installazione: `provision.file` non passato al build |
 | `Verified by Parvasoft` con Allow/Remember | catena ok ma impronta non ancora salvata: succede solo se la lista consentiti non è scrivibile |
 
-I log di QZ Tray sono in `%APPDATA%\qz\debug.log` su Windows e
-`~/Library/Application Support/qz/debug.log` su macOS (`App.java:130`).
+I log sono in `%APPDATA%\parva\debug.log` su Windows e
+`~/Library/Application Support/parva/debug.log` su macOS (`App.java:130`).
 
 ### 6. Aggiungere un ambiente o rinnovare
 
