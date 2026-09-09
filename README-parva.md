@@ -281,69 +281,328 @@ terze parti, QZ lo aggiunge da solo alla lista consentiti alla prima richiesta
 valida (`Certificate.java:248-261`), quindi il popup non compare mai. La
 `whitelist/` serve solo per pre-approvare un certificato self-signed, senza CA.
 
-### 3. Backend: i due endpoint
+### 3. Backend: gli endpoint che firmano
 
-`/qz/cert` restituisce il certificato pubblico, `/qz/sign` firma la stringa
-ricevuta. JAX-RS, funziona sia su TomEE che su Quarkus:
+Il backend che firma è 7FTCustoms. Servono due endpoint: `api/qz/cert`
+restituisce il certificato pubblico dell'ambiente, `api/qz/sign` firma la stringa
+che QZ gli passa. Vanno accanto agli altri controller in
+`SevenFreightools/SevenFreightools.Web/API/`.
 
-```java
-@Path("/qz")
-public class QzSigning {
+Il codice qui sotto è una proposta: **non è stato applicato a 7FTCustoms**, va
+portato là con un ticket suo.
 
-    private static final PrivateKey KEY = loadKey(System.getenv("QZ_KEY_PATH"));
+#### Risorse da aggiungere al progetto
 
-    @GET @Path("/cert") @Produces(MediaType.TEXT_PLAIN)
-    public String cert() throws IOException {
-        return Files.readString(Path.of(System.getenv("QZ_CERT_PATH")));
-    }
+Lo script `parva/make-signing-certs.sh` produce `<env>.crt` e `<env>-key.pem`.
+Per un backend .NET conviene però **un solo file `.pfx`** che li contiene
+entrambi, per due motivi concreti:
 
-    @GET @Path("/sign") @Produces(MediaType.TEXT_PLAIN)
-    public String sign(@QueryParam("request") String toSign) throws GeneralSecurityException {
-        Signature sig = Signature.getInstance("SHA512withRSA");
-        sig.initSign(KEY);
-        sig.update(toSign.getBytes(StandardCharsets.UTF_8));
-        return Base64.getEncoder().encodeToString(sig.sign());
-    }
+* il progetto è su **.NET Framework 4.8**, dove `RSA.ImportPkcs8PrivateKey` non
+  esiste: quello arriva con .NET Core 3.0. Leggere una chiave PEM richiederebbe
+  quindi una libreria, mentre un PKCS#12 lo apre `X509Certificate2` della BCL
+  senza aggiungere niente;
+* con un file solo, certificato e chiave non possono disallinearsi. Con due file
+  è una svista che si scopre in produzione, quando la firma non verifica.
 
-    private static PrivateKey loadKey(String path) {
-        try {
-            String pem = Files.readString(Path.of(path))
-                    .replaceAll("-----(BEGIN|END) PRIVATE KEY-----", "")
-                    .replaceAll("\\s", "");
-            return KeyFactory.getInstance("RSA")
-                    .generatePrivate(new PKCS8EncodedKeySpec(Base64.getDecoder().decode(pem)));
-        } catch(Exception e) {
-            throw new IllegalStateException("Chiave di firma QZ non caricabile: " + path, e);
+Il `.pfx` si ricava da quello che già generiamo:
+
+```bash
+openssl pkcs12 -export \
+    -inkey parva/certs/prod-key.pem -in parva/certs/prod.crt \
+    -name "Parvasoft QZ signing" \
+    -out parva/certs/prod.pfx -passout pass:
+```
+
+| file | dove va | in git |
+|---|---|---|
+| `prod.pfx` | sul server dell'ambiente, **fuori dalla cartella di deploy** | **mai** |
+| `ca.crt` | dentro l'installer di Parva Tray, non serve al backend | no (già ignorato) |
+
+Percorso consigliato `C:\ProgramData\Parvasoft\qz\prod.pfx`, con ACL di
+lettura alla sola identità dell'application pool. Fuori dal deploy perché dentro
+finirebbe nei pacchetti di rilascio, nei backup e nelle copie dell'artefatto.
+
+Il percorso si configura come tutto il resto dell'applicazione, con un
+`appSettings` letto da `ConfigurationManager`:
+
+```xml
+<add key="QzSigningCertPath" value="C:\ProgramData\Parvasoft\qz\prod.pfx" />
+```
+
+**Sulla password del `.pfx`.** Il comando qui sopra usa `-passout pass:`, cioè
+nessuna password: il file è protetto dalle ACL, esattamente come lo sarebbe
+`prod-key.pem`, che infatti generiamo con `-nodes`. Se una policy interna
+richiede la password, va letta da una **variabile d'ambiente**, non da
+`Web.config`: quel file è tracciato in git in questo repository — ci sta già
+dentro `SystemMailPassword` in chiaro — e aggiungerci la password della chiave di
+firma significherebbe pubblicarla a tutti quelli che clonano.
+
+#### Il controller
+
+```csharp
+using System;
+using System.Configuration;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Web.Http;
+using System.Web.Http.Description;
+
+namespace SevenFreightools.API
+{
+    /// <summary>
+    /// Firma le richieste di stampa inviate a Parva Tray. Senza una firma valida
+    /// QZ mostra un popup di conferma a ogni stampa.
+    /// </summary>
+    [RoutePrefix("api/qz")]
+    [Authorize]
+    [ApiExplorerSettings(IgnoreApi = true)]
+    public class QzController : ApiController
+    {
+        // Caricato una volta sola: su Windows ogni apertura di un PKCS#12 con
+        // MachineKeySet scrive un key container su disco, quindi ricaricarlo a
+        // ogni stampa li accumulerebbe in MachineKeys senza mai ripulirli.
+        private static readonly Lazy<X509Certificate2> Signer =
+            new Lazy<X509Certificate2>(LoadCertificate);
+
+        [HttpGet, Route("cert")]
+        public HttpResponseMessage Cert()
+        {
+            var pem = new StringBuilder()
+                .AppendLine("-----BEGIN CERTIFICATE-----")
+                .AppendLine(Convert.ToBase64String(Signer.Value.RawData,
+                                                   Base64FormattingOptions.InsertLineBreaks))
+                .AppendLine("-----END CERTIFICATE-----")
+                .ToString();
+
+            return Text(pem);
+        }
+
+        [HttpGet, Route("sign")]
+        public HttpResponseMessage Sign(string request)
+        {
+            if (string.IsNullOrEmpty(request))
+                return Request.CreateErrorResponse(HttpStatusCode.BadRequest, "Nothing to sign.");
+
+            // SHA512 deve corrispondere a setSignatureAlgorithm lato client:
+            // il default di QZ è SHA1 e la verifica fallirebbe senza dire perché.
+            using (var rsa = Signer.Value.GetRSAPrivateKey())
+            {
+                var signature = rsa.SignData(Encoding.UTF8.GetBytes(request),
+                                             HashAlgorithmName.SHA512,
+                                             RSASignaturePadding.Pkcs1);
+
+                return Text(Convert.ToBase64String(signature));
+            }
+        }
+
+        /// <summary>
+        /// QZ si aspetta il corpo così com'è. Restituendo una string, Web API la
+        /// serializzerebbe in JSON, virgolette comprese, e la firma non verificherebbe.
+        /// </summary>
+        private HttpResponseMessage Text(string body)
+        {
+            var response = Request.CreateResponse(HttpStatusCode.OK);
+            response.Content = new StringContent(body, Encoding.UTF8, "text/plain");
+            return response;
+        }
+
+        private static X509Certificate2 LoadCertificate()
+        {
+            var path = ConfigurationManager.AppSettings["QzSigningCertPath"];
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                throw new InvalidOperationException(
+                    "Certificato di firma QZ non trovato, QzSigningCertPath = " + path);
+
+            // MachineKeySet: sotto IIS l'identità dell'app pool non ha un profilo
+            // utente caricato, e senza questo flag la chiave privata non si apre.
+            return new X509Certificate2(
+                path,
+                Environment.GetEnvironmentVariable("QZ_CERT_PASSWORD") ?? string.Empty,
+                X509KeyStorageFlags.MachineKeySet);
         }
     }
 }
 ```
 
-La chiave è già in PKCS#8, il formato che si aspetta `KeyFactory`.
+Sull'autenticazione: `[Authorize]` è quello che usano già `CommandController` e
+`ExportController`, e in questa applicazione significa il cookie di sessione di
+Serenity. L'interceptor Angular manda `withCredentials` su ogni chiamata, quindi
+dal frontend non serve fare niente di speciale.
 
-`QZ_KEY_PATH` e `QZ_CERT_PATH` puntano a file fuori dal war: dentro
-l'artefatto la chiave finirebbe nei backup, nei registry e nei cloni del repo.
+**`api/qz/sign` firma qualunque stringa gli venga passata.** Lasciato anonimo
+equivale a pubblicare la chiave privata: chiunque si farebbe firmare le proprie
+richieste e stamperebbe sulle macchine dei clienti. L'attributo `[Authorize]` non
+è una formalità, è la misura di sicurezza.
 
-**`/qz/sign` firma qualunque stringa gli si passi.** Lasciato aperto equivale a
-pubblicare la chiave privata: chiunque si fa firmare le proprie richieste e
-stampa sulle macchine dei clienti. Va dietro l'autenticazione dell'applicazione,
-esattamente come il resto delle API.
+#### Variante senza PFX
+
+Se si preferisce distribuire la coppia `.crt` + `-key.pem` così com'è, la strada
+esiste senza aggiungere dipendenze: `SevenFreightools.Services` referenzia già
+BouncyCastle (`Portable.BouncyCastle 1.9.0` e `BouncyCastle.Cryptography 2.0.0`),
+il cui `PemReader` legge il PKCS#8 in poche righe. Restano però due file da
+tenere allineati a mano, che è il motivo per cui sopra è consigliato il `.pfx`.
+
+#### Variante Java 8 / TomEE 1.7.3
+
+Se il backend è l'applicazione Java, il `.pfx` non serve: `prod-key.pem` è già
+PKCS#8 (`-----BEGIN PRIVATE KEY-----`), che `PKCS8EncodedKeySpec` legge senza
+librerie. Si deployano i due file così come escono dallo script.
+
+TomEE 1.7.3 è Java EE 6, quindi **JAX-RS 1.1**, e gira su Java 8: niente
+`Files.readString` né `Path.of`, che sono API di Java 11.
+
+TomEE pubblica le risorse JAX-RS a partire da una classe `Application`:
+
+```java
+package eu.parvasoft.qz;
+
+import javax.ws.rs.ApplicationPath;
+import javax.ws.rs.core.Application;
+
+@ApplicationPath("/api")
+public class QzApplication extends Application {
+}
+```
+
+```java
+package eu.parvasoft.qz;
+
+import javax.ws.rs.GET;
+import javax.ws.rs.Path;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.WebApplicationException;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.security.KeyFactory;
+import java.security.PrivateKey;
+import java.security.Signature;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.Base64;
+
+/**
+ * Firma le richieste di stampa inviate a Parva Tray. Senza una firma valida QZ
+ * mostra un popup di conferma a ogni stampa.
+ */
+@Path("/qz")
+public class QzResource {
+
+    private static final String CERT_PATH = System.getenv("QZ_CERT_PATH");
+    private static final String KEY_PATH = System.getenv("QZ_KEY_PATH");
+
+    /** Caricata una volta sola: il parsing PKCS#8 non ha motivo di ripetersi a ogni stampa. */
+    private static final PrivateKey KEY = loadKey();
+
+    @GET
+    @Path("/cert")
+    @Produces(MediaType.TEXT_PLAIN)
+    public String cert() throws IOException {
+        return new String(Files.readAllBytes(Paths.get(CERT_PATH)), StandardCharsets.UTF_8);
+    }
+
+    @GET
+    @Path("/sign")
+    @Produces(MediaType.TEXT_PLAIN)
+    public String sign(@QueryParam("request") String toSign) throws Exception {
+        if (toSign == null || toSign.isEmpty()) {
+            throw new WebApplicationException(Response.Status.BAD_REQUEST);
+        }
+
+        // SHA512 deve corrispondere a setSignatureAlgorithm lato client: il default
+        // di QZ è SHA1 e la verifica fallirebbe senza dire perché.
+        // Signature non è thread safe, quindi se ne crea una per richiesta.
+        Signature signature = Signature.getInstance("SHA512withRSA");
+        signature.initSign(KEY);
+        signature.update(toSign.getBytes(StandardCharsets.UTF_8));
+
+        return Base64.getEncoder().encodeToString(signature.sign());
+    }
+
+    private static PrivateKey loadKey() {
+        try {
+            String pem = new String(Files.readAllBytes(Paths.get(KEY_PATH)), StandardCharsets.UTF_8)
+                    .replaceAll("-----(BEGIN|END) PRIVATE KEY-----", "")
+                    .replaceAll("\\s", "");
+
+            return KeyFactory.getInstance("RSA")
+                    .generatePrivate(new PKCS8EncodedKeySpec(Base64.getDecoder().decode(pem)));
+        } catch (Exception e) {
+            throw new IllegalStateException("Chiave di firma QZ non caricabile: " + KEY_PATH, e);
+        }
+    }
+}
+```
+
+Il decoder base64 va alimentato senza spazi: `Base64.getDecoder()` non tollera gli
+a capo del PEM, da cui il `replaceAll` sugli spazi. Se preferite non toglierli,
+`Base64.getMimeDecoder()` li ignora da solo.
+
+A differenza di Web API, qui non c'è la trappola del JSON: con
+`@Produces(MediaType.TEXT_PLAIN)` una `String` esce come corpo grezzo, che è
+quello che QZ si aspetta.
+
+L'autenticazione è quella del contenitore, con un vincolo su questi due path in
+`web.xml`. Il ruolo va sostituito con quello dell'applicazione:
+
+```xml
+<security-constraint>
+    <web-resource-collection>
+        <web-resource-name>Firma di stampa QZ</web-resource-name>
+        <url-pattern>/api/qz/*</url-pattern>
+    </web-resource-collection>
+    <auth-constraint>
+        <role-name>utente</role-name>
+    </auth-constraint>
+</security-constraint>
+```
+
+Vale anche qui, e vale doppio: **`/api/qz/sign` firma qualunque stringa gli venga
+passata.** Senza il vincolo è come pubblicare la chiave privata.
+
+Se invece volete un artefatto solo per entrambi i backend, il `.pfx` lo legge
+anche Java, con `KeyStore.getInstance("PKCS12")`, `ks.load(stream, password)` e
+`ks.getKey(alias, password)`; con il `.pfx` senza password si passa
+`new char[0]`.
 
 ### 4. Frontend
 
-```js
-qz.security.setCertificatePromise((resolve, reject) =>
-    fetch('/qz/cert').then(r => r.text()).then(resolve).catch(reject));
+Le tre chiamate a QZ vanno fatte una volta sola, all'avvio. Usando `HttpClient` e
+non `fetch` passano dall'`authInterceptor`, quindi cookie di sessione e gestione
+degli errori dell'applicazione valgono anche qui:
 
-qz.security.setSignatureAlgorithm('SHA512');   // senza questo QZ assume SHA1
+```ts
+@Injectable({ providedIn: 'root' })
+export class QzSigningService {
+  private readonly http = inject(HttpClient);
 
-qz.security.setSignaturePromise(toSign => (resolve, reject) =>
-    fetch('/qz/sign?request=' + encodeURIComponent(toSign))
-        .then(r => r.text()).then(resolve).catch(reject));
+  configure(): void {
+    qz.security.setCertificatePromise((resolve, reject) =>
+      this.http.get('api/qz/cert', { responseType: 'text' })
+        .subscribe({ next: resolve, error: reject }));
+
+    // senza questo QZ assume SHA1 (PrintSocketClient.java:221)
+    qz.security.setSignatureAlgorithm('SHA512');
+
+    qz.security.setSignaturePromise((toSign: string) => (resolve, reject) =>
+      this.http.get('api/qz/sign', { params: { request: toSign }, responseType: 'text' })
+        .subscribe({ next: resolve, error: reject }));
+  }
+}
 ```
 
-L'algoritmo va dichiarato su entrambi i lati: il default lato QZ è SHA1
-(`PrintSocketClient.java:221`).
+`responseType: 'text'` non è un dettaglio: senza, `HttpClient` prova a fare il
+parse JSON del PEM e della firma, e fallisce prima ancora di arrivare a QZ.
+
+L'algoritmo va dichiarato su entrambi i lati, qui e nel controller: il default
+lato QZ è SHA1.
 
 ### 5. Provare tutto in locale
 
