@@ -85,6 +85,12 @@ altrimenti esce un pacchetto senza la nostra CA e QZ mostra il popup a ogni
 stampa (vedi "Certificati di firma QZ"). Il jar da solo non c'entra: la CA entra
 a livello di installer.
 
+I percorsi dentro `provision.json` sono relativi **al file stesso**, non alla
+directory da cui lanci ant (`ProvisionBuilder.java:151`). E siccome `parva/certs/`
+è escluso da git, su una macchina di build appena clonata quella cartella non
+esiste: `ca.crt` va copiato a mano, e dev'essere lo **stesso** usato per gli altri
+ambienti. Non rilanciare lì `make-signing-certs.sh`, creerebbe una CA diversa.
+
 L'architettura di default è quella dell'host. Per l'altra:
 `-Dtarget.arch=x86_64` oppure `-Dtarget.arch=aarch64`; sono due pacchetti
 distinti, non uno universale.
@@ -130,8 +136,31 @@ cerca lì (`ant/windows/installer.xml:166`).
 ```powershell
 $env:JAVA_HOME = "C:\Program Files\Amazon Corretto\jdk25"   # adatta alla versione installata
 
-ant nsis -Dprovision.file=parva/provision.json
+ant nsis "-Dprovision.file=parva/provision.json"
 ```
+
+**Le virgolette attorno al `-D` non sono facoltative.** Su Windows `ant` è
+`ant.bat`, e il passaggio degli argomenti attraverso cmd spezza il token
+sull'uguale: Ant riceve il percorso come argomento a sé e lo interpreta come nome
+di un target, fallendo con
+
+```
+Target "parva/provision.json" does not exist in the project "qz".
+```
+
+Il messaggio trae in inganno due volte: non parla del certificato, e quel `qz` è
+solo il nome del progetto Ant (`build.xml:3`), rimasto di upstream. Lo stesso
+errore esce scrivendo `-Dprovision.file parva/provision.json` con lo spazio al
+posto dell'uguale, o se il percorso contiene spazi.
+
+Dopo che il build parte, la conferma che il flag sia arrivato è questa riga nel
+log:
+
+```
+Found provision file 'parva/provision.json' calling 'provision --json [...]'
+```
+
+Se non compare, il pacchetto esce senza CA anche se il build riesce.
 
 L'architettura di default è quella della macchina, quindi su un Windows x64 esce
 già `x86_64`. I target `dmg` e `pkgbuild` da qui non si possono fare.
