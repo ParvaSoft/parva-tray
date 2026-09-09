@@ -790,6 +790,193 @@ dipendeva da come era configurata la coda. Ora:
 * i dati base64 con prefisso `data:...;base64,` vengono ripuliti, altrimenti la
   stampante riceve byte spazzatura e li stampa come pagine di testo.
 
+## Integrazione lato applicazione
+
+Questa sezione è per chi integra la stampa in 7FTCustoms. La pagina di test
+(`parva/test-backend.py`) è un riferimento utile da guardare, ma non è un
+esempio copiabile: è la demo di upstream, jQuery e Bootstrap, con la logica di
+connessione intrecciata ai suoi controlli. Qui c'è il minimo che serve davvero.
+
+### Il client JavaScript
+
+Il client è il pacchetto npm di upstream, LGPL-2.1:
+
+```bash
+npm install qz-tray
+```
+
+**Non va rebrandizzato.** Parla il protocollo, non conosce il nome dell'app, e
+funziona identico con Parva Tray. L'unico punto sensibile al nostro rebranding è
+lo schema URL usato per avviare il tray: la demo di upstream ha `qz:launch`
+hardcoded, per noi è `parva:launch` (il valore di `project.datadir`).
+
+Il pacchetto **non ha tipi TypeScript**. Serve una dichiarazione, che conviene
+scrivere sui soli membri che usiamo invece di dichiarare tutto `any`:
+
+```ts
+// src/types/qz-tray.d.ts
+declare module 'qz-tray' {
+  export interface ConnectOptions {
+    host?: string | string[];
+    usingSecure?: boolean;
+    retries?: number;
+    delay?: number;
+  }
+
+  export interface PrintData {
+    type: 'raw' | 'pixel';
+    format?: 'command' | 'direct' | 'html' | 'image' | 'pdf';
+    flavor?: 'plain' | 'base64' | 'hex' | 'file' | 'xml';
+    data: string;
+    options?: Record<string, unknown>;
+  }
+
+  export interface Config { }
+
+  const qz: {
+    websocket: {
+      connect(options?: ConnectOptions): Promise<void>;
+      disconnect(): Promise<void>;
+      isActive(): boolean;
+    };
+    security: {
+      setCertificatePromise(handler: (resolve: (cert: string) => void, reject: (e: unknown) => void) => void): void;
+      setSignatureAlgorithm(algorithm: 'SHA1' | 'SHA256' | 'SHA512'): void;
+      setSignaturePromise(factory: (toSign: string) => (resolve: (sig: string) => void, reject: (e: unknown) => void) => void): void;
+    };
+    printers: {
+      getDefault(): Promise<string>;
+      find(query?: string): Promise<string | string[]>;
+      details(): Promise<unknown[]>;
+    };
+    configs: {
+      create(printer: string, options?: Record<string, unknown>): Config;
+    };
+    print(config: Config, data: (PrintData | string)[]): Promise<void>;
+  };
+
+  export default qz;
+}
+```
+
+### Connessione
+
+Conviene connettersi **alla prima stampa**, non all'avvio dell'applicazione: chi
+non stampa mai non deve vedere errori per un software che non ha installato.
+
+```ts
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import qz, { PrintData } from 'qz-tray';
+
+@Injectable({ providedIn: 'root' })
+export class ParvaTrayService {
+  private readonly http = inject(HttpClient);
+  private securityReady = false;
+
+  /** Idempotente: si può chiamare prima di ogni stampa. */
+  async connect(): Promise<void> {
+    if (qz.websocket.isActive()) { return; }
+
+    this.configureSecurity();
+
+    try {
+      await qz.websocket.connect({ retries: 2, delay: 1 });
+    } catch {
+      // Installato ma non in esecuzione: il protocollo registrato dall'installer
+      // lo avvia. Se anche il secondo tentativo fallisce, non è installato.
+      window.location.assign('parva:launch');
+      await qz.websocket.connect({ retries: 5, delay: 1 });
+    }
+  }
+
+  async print(data: PrintData[], printer?: string, options?: Record<string, unknown>): Promise<void> {
+    await this.connect();
+    const target = printer ?? await qz.printers.getDefault();
+    await qz.print(qz.configs.create(target, options), data);
+  }
+
+  /**
+   * Le promise di firma vanno registrate una volta sola, prima della connessione.
+   * Passando da HttpClient e non da fetch valgono authInterceptor e la gestione
+   * errori dell'applicazione.
+   */
+  private configureSecurity(): void {
+    if (this.securityReady) { return; }
+    this.securityReady = true;
+
+    qz.security.setCertificatePromise((resolve, reject) =>
+      this.http.get('api/qz/cert', { responseType: 'text' })
+        .subscribe({ next: resolve, error: reject }));
+
+    // senza questo QZ assume SHA1 (PrintSocketClient.java:221)
+    qz.security.setSignatureAlgorithm('SHA512');
+
+    qz.security.setSignaturePromise((toSign: string) => (resolve, reject) =>
+      this.http.get('api/qz/sign', { params: { request: toSign }, responseType: 'text' })
+        .subscribe({ next: resolve, error: reject }));
+  }
+}
+```
+
+### Tutte le forme di chiamata
+
+`qz.print(config, data)` accetta un array: ogni elemento è un documento o un
+blocco di comandi, e possono avere forme diverse nella stessa chiamata.
+
+| cosa stampi | chiamata |
+|---|---|
+| comandi nativi (ZPL, EPL, ESC/POS…) | `{ type: 'raw', data: '^XA…^XZ' }` |
+| gli stessi comandi da un file o URL | `{ type: 'raw', flavor: 'file', data: 'https://…/etichetta.zpl' }` |
+| un'immagine convertita nel linguaggio dell'etichettatrice | `{ type: 'raw', format: 'image', flavor: 'file', data: '…/logo.png', options: { language: 'zpl' } }` |
+| un PDF renderizzato da Parva Tray | `{ type: 'pixel', format: 'pdf', flavor: 'file', data: 'https://…/fattura.pdf' }` |
+| dell'HTML renderizzato da Parva Tray | `{ type: 'pixel', format: 'html', flavor: 'plain', data: '<h1>…</h1>' }` |
+| un'immagine renderizzata da Parva Tray | `{ type: 'pixel', format: 'image', flavor: 'base64', data: 'iVBORw0…' }` |
+| un documento consegnato **intatto** allo spooler | `{ type: 'pixel', format: 'direct', flavor: 'file', data: 'https://…/fattura.pdf' }` |
+
+I `flavor` disponibili sono `plain` (il valore è il dato), `base64`, `hex`,
+`file` (il valore è una URL, anche `file://`, che apre **il processo di Parva
+Tray**, non il browser) e `xml` (base64 dentro un tag, con `options.xmlTag`).
+
+I linguaggi accettati da `options.language` per il ramo raw sono quelli di
+`LanguageType`: `ZPL`, `EPL`, `CPCL`, `ESCPOS`, `SBPL`, `PGL`, `EVOLIS`, `FGL`,
+`DPL`, `CPL`, `ESCP`, `JSCRIPT`, `LP`, `STAR`, con i soliti alias (`ZEBRA` per
+ZPL, `ELTRON` per EPL, `SATO` per SBPL…).
+
+`type: 'raw'` forza sempre il formato a `command` (`PrintingUtilities.java:138`):
+i formati `html`, `image` e `pdf` dentro un item raw vengono comunque gestiti,
+perché li interpreta `PrintRaw` convertendoli in immagine e poi nel linguaggio
+della stampante. `format: 'direct'` invece richiede `type: 'pixel'`.
+
+Oltre alla stampa, sul client esistono:
+
+```ts
+qz.printers.getDefault()        // nome della stampante predefinita
+qz.printers.find('Zebra')       // ricerca per sottostringa, o tutte se omesso
+qz.printers.details()           // driver, densita', vassoi, formati supportati
+qz.printers.getStatus()         // stato via listener, previo startListening
+```
+
+Ci sono anche i namespace `serial`, `socket`, `usb`, `hid`, `file` e
+`networking`, per dialogare con bilance, lettori e periferiche. Non servono alla
+stampa e ogni loro chiamata è firmata come le altre, quindi passa dagli stessi
+due endpoint.
+
+### Gli errori che l'utente vedrà davvero
+
+Sono tre casi con rimedi diversi, e vanno distinti nel messaggio: "riprova"
+nasconde il rimedio. La `NotificationService` dell'applicazione c'è già.
+
+| situazione | come si riconosce | cosa dire |
+|---|---|---|
+| Parva Tray non installato | `connect` fallisce, `parva:launch` non apre niente, e anche il secondo tentativo fallisce | "Parva Tray non risulta installato su questo computer": è un'installazione da fare, non un errore temporaneo |
+| installato ma non in esecuzione | il primo `connect` fallisce, dopo `parva:launch` il secondo riesce | niente da dire: si è risolto da solo |
+| firma rifiutata | la connessione riesce, ma compare il popup di conferma a ogni stampa | è un problema di configurazione lato server o di CA mancante nell'installazione: vedi "Se il popup esce lo stesso" |
+
+Dal browser i primi due non si distinguono in modo pulito: l'unico
+discriminante è il secondo tentativo dopo `parva:launch`. È il motivo per cui
+nel servizio qui sopra il retry non è un dettaglio ma la logica di diagnosi.
+
 ## Licenza
 
 Upstream è LGPL-2.1. Il repo privato va bene; se distribuiamo a un cliente un
