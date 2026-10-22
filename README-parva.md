@@ -362,9 +362,8 @@ Il percorso si configura come tutto il resto dell'applicazione, con un
 nessuna password: il file è protetto dalle ACL, esattamente come lo sarebbe
 `prod-key.pem`, che infatti generiamo con `-nodes`. Se una policy interna
 richiede la password, va letta da una **variabile d'ambiente**, non da
-`Web.config`: quel file è tracciato in git in questo repository — ci sta già
-dentro `SystemMailPassword` in chiaro — e aggiungerci la password della chiave di
-firma significherebbe pubblicarla a tutti quelli che clonano.
+`Web.config`: quel file è tracciato in git, e aggiungerci la password della
+chiave di firma significherebbe pubblicarla a tutti quelli che clonano.
 
 #### Il controller
 
