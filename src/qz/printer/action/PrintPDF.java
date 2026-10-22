@@ -28,6 +28,7 @@ import qz.utils.SystemUtilities;
 import javax.print.attribute.PrintRequestAttributeSet;
 import javax.print.attribute.standard.Media;
 import javax.print.attribute.standard.MediaPrintableArea;
+import javax.print.attribute.standard.PrinterResolution;
 import java.awt.*;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
@@ -233,6 +234,13 @@ public class PrintPDF extends PrintPixel implements PrintProcessor {
         if (SystemUtilities.isMac() && Constants.JAVA_VERSION.compareWithBuildsTo(Version.valueOf("1.8.0+202")) < 0) {
             log.warn("MacOS and Java < 1.8.0u202 cannot use attributes with PDF prints, disabling");
             attributes.clear();
+        }
+
+        // Quando rasterizza, density e' solo la risoluzione dell'immagine disegnata da PDFBox. Come risoluzione
+        // del job, se diversa da quella del driver, su Windows sposta la pagina (WPrinterJob divide l'offset
+        // fisico, in pixel del driver, per i dpi chiesti). Il job resta ai dpi del driver e Java scala l'immagine.
+        if (pxlOpts.isRasterize() && pxlOpts.getDensity() > 0) {
+            attributes.remove(PrinterResolution.class);
         }
 
         RenderingHints hints = new RenderingHints(buildRenderingHints(pxlOpts.getDithering(), pxlOpts.getInterpolation()));
